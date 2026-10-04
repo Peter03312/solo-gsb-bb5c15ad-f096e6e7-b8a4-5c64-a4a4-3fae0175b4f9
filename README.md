@@ -63,6 +63,14 @@ d = |Δbay| + |Δrow| + |Δtier|
 - 旧清单继续可查，列表中以 `current` 标识其是否指向当前修订号——因此**永远不存在指向过期布局的“当前清单”**；
 - 对同一修订号重复签发幂等（返回已冻结的清单）。
 
+### 安全约束变更
+
+- `PUT /constraints` 携带所见 `baseRevision`，**整组**提交默认列承重、按列覆盖限额、不相容类别对；未列出的覆盖项/类别对即撤销，舱位尺寸与箱档案不变；
+- 沿用登记校验：重量正数、列坐标在舱位范围内、类别对唯一；
+- 受理前用新约束复验**当前完整布局**，违反配载规则即 422（箱号/位置/原因），规则与修订号不变；修订号过期 409 回带当前号；
+- 受理即修订号 +1，**布局原样继承**；后续布局调整与签发使用新约束；
+- 每个修订号留一整套约束快照，历史布局/约束查询展示**当时生效**的约束；已签发清单与在办核对始终以各自冻结副本为基准。
+
 ---
 
 ## 2. 一键启动（Docker Compose）
@@ -122,6 +130,7 @@ npm test           # 纯函数单元测试（配载规则 + 装船核对）
 # 端到端测试（需 devDependency embedded-postgres，首次运行会自动下载本地 PG）
 npm run build && node test/e2e.js        # 配载/签发/并发
 npm run build && node test/e2e-check.js  # 核对作业/上报/结案/并发
+npm run build && node test/e2e-constraints.js  # 安全约束变更/复验/历史留痕/并发
 ```
 
 ---
@@ -135,7 +144,9 @@ npm run build && node test/e2e-check.js  # 核对作业/上报/结案/并发
 | `POST` | `/api/voyages` | 登记航次（舱位、列承重、箱、不相容规则） |
 | `GET` | `/api/voyages` | 航次列表 |
 | `GET` | `/api/voyages/:id` | 航次元数据（含当前修订号） |
-| `GET` | `/api/voyages/:id/layout?rev=N` | 查看布局（缺省当前修订号；可查历史） |
+| `GET` | `/api/voyages/:id/layout?rev=N` | 查看布局（缺省当前修订号；可查历史）。响应内嵌该修订号**当时生效的约束** |
+| `PUT` | `/api/voyages/:id/constraints` | **变更安全约束**（整组替换默认列承重/按列覆盖/类别对，携带 `baseRevision`） |
+| `GET` | `/api/voyages/:id/constraints?rev=N` | 查看某修订号生效的安全约束（缺省当前；历史修订号返回当时清单） |
 | `POST` | `/api/voyages/:id/moves` | **整批调整**（携带 `baseRevision`） |
 | `POST` | `/api/voyages/:id/manifests` | **签发装载清单**（携带 `expectedRevision`） |
 | `GET` | `/api/voyages/:id/manifests` | 清单列表（旧清单保留，带 `current` 标记） |
@@ -242,7 +253,47 @@ curl -sS -X POST http://localhost:3000/api/voyages/<id>/moves \
 }
 ```
 
-### 4.5 签发与冻结
+### 4.5 变更安全约束（整组替换）
+
+航次安全约束（默认列承重、按列覆盖限额、不相容类别对最小距离）可在不改变**舱位尺寸**与**箱档案**的前提下整组替换。调度员携带所见的 `baseRevision`，提交**整套**清单：
+
+- `columnWeightLimits` / `incompatRules` 均为**整组清单语义**——未列出的覆盖项与类别对即**撤销**（类别对撤销即恢复相容）；空数组表示撤销全部；
+- 重量必须为**正数**（十进制，最多 6 位小数）、列坐标必须在舱位范围内、类别对**唯一**（归一化 `(A,B)` 与 `(B,A)` 视为同一对），与登记时完全一致的校验；
+- **受理前**按新约束对**当前完整布局**复验全部配载规则：任一违反即 **422**，返回箱号、位置与原因（同 4.3 的 `violations` 结构），**规则与修订号均不变**；
+- `baseRevision` 与当前修订号不一致 → **409 `stale_revision`**，`details.currentRevision` 回带当前号；
+- 受理后修订号 **+1**：写入新约束快照，**布局原样继承**（箱位一个不动），随后的布局调整与签发均使用新约束。
+
+```bash
+curl -sS -X PUT http://localhost:3000/api/voyages/<id>/constraints \
+  -H 'content-type: application/json' -d '{
+  "baseRevision": 1,
+  "defaultColumnWeightLimit": "8000",
+  "columnWeightLimits": [],
+  "incompatRules": []
+}'
+```
+
+上例把默认列承重改为 `8000`，并**撤销**全部按列覆盖与不相容类别对（此后所有类别两两相容）。成功返回 `{ revision, previousRevision, layout }`，其中 `layout` 为继承下来的完整布局，内嵌的正是新生效的约束：
+
+```json
+{
+  "revision": 2,
+  "previousRevision": 1,
+  "layout": {
+    "revision": 2, "current": true,
+    "defaultColumnWeightLimit": "8000",
+    "columnWeightLimits": [],
+    "incompatRules": [],
+    "placements": [ /* 与 rev=1 完全一致，布局原样继承 */ ]
+  }
+}
+```
+
+约束按修订号全量留痕：`GET /layout?rev=N` 与 `GET /constraints?rev=N` 对历史修订号返回的都是**当时生效**的约束。已签发清单（`manifest_items` 冻结副本）与在办核对作业（冻结基准）不受后续约束变更影响；后续新的布局调整和签发才使用新约束。
+
+请求级错误码（HTTP 400，`details.issues[]`）：`invalid_column_limit`（列坐标越界）、`duplicate_column_limit`（同一列覆盖出现多次）、`duplicate_incompat_rule`（归一化后类别对重复）；重量非正由请求体校验拦截。
+
+### 4.6 签发与冻结
 
 ```bash
 curl -sS -X POST http://localhost:3000/api/voyages/<id>/manifests \
@@ -251,7 +302,7 @@ curl -sS -X POST http://localhost:3000/api/voyages/<id>/manifests \
 
 返回冻结清单（`current:true`）。之后再调整布局，重新 `GET /manifests` 可见旧清单 `current:false` 仍在；只有再次签发才会产生指向当前布局的新清单。
 
-### 4.6 现场装船核对
+### 4.7 现场装船核对
 
 核对作业以航次**已签发清单的修订号**为基准开启；同一清单最多一个作业。基准引用冻结副本（`manifest_items`），开工后无论布局怎样调整、签发多少新清单，该作业的核对基准都不变。
 
@@ -330,10 +381,10 @@ curl -sS -X POST http://localhost:3000/api/check-jobs/<jobId>/close
 | 状态 | 场景 |
 | --- | --- |
 | 200 / 201 | 查询成功 / 创建或首次签发、首次受理上报、首次结案成功（幂等重试返回 200） |
-| 400 | 请求体非法、未知箱、坐标越界、同批重复箱号 |
+| 400 | 请求体非法、未知箱、坐标越界、同批重复箱号；约束变更的列坐标越界 / 列覆盖重复 / 类别对重复 |
 | 404 | 航次/修订号/清单/核对作业不存在（含以未签发清单开工） |
-| 409 | 修订号过期；同清单重复开工、上报号内容冲突、结案后新上报、核对有差异不可结案 |
-| 422 | 配载规则违反整批拒绝；或尚有箱未配位即签发 |
+| 409 | 修订号过期（整批调整 / 签发 / 约束变更）；同清单重复开工、上报号内容冲突、结案后新上报、核对有差异不可结案 |
+| 422 | 配载规则违反整批拒绝（整批调整 / 约束变更复验当前布局）；或尚有箱未配位即签发 |
 | 503 | `/health` 数据库不可达 |
 
 ---
@@ -350,6 +401,12 @@ curl -sS -X POST http://localhost:3000/api/check-jobs/<jobId>/close
 
   ```bash
   BASE=http://localhost:3000 bash examples/check-curl.sh
+  ```
+
+- `examples/constraints-curl.sh` —— 安全约束变更全流程 curl（收紧被复验拒绝→过期修订号→整组替换受理→历史约束→后续调整用新约束）：
+
+  ```bash
+  BASE=http://localhost:3000 bash examples/constraints-curl.sh
   ```
 
 - `examples/api.http` —— REST Client / JetBrains HTTP Client 文件（含核对段落）；
@@ -370,7 +427,7 @@ src/
   service.ts       事务编排：乐观修订号、整批调整、签发冻结、并发互斥
   check-service.ts 核对作业事务：开工/上报幂等与冲突/留痕/状态/结案冻结（行级互斥）
   db.ts            连接池、等待就绪、幂等建表
-  schema.sql       PostgreSQL 表结构（航次/列限/箱/不相容规则/修订布局/清单/核对作业与上报）
+  schema.sql       PostgreSQL 表结构（航次/列限/箱/不相容规则/修订布局/修订约束快照/清单/核对作业与上报）
   http/            Express 路由与 zod 请求校验
   config.ts errors.ts app.ts start.ts
 test/
@@ -385,7 +442,8 @@ Dockerfile  docker-compose.yml
 ### 存储要点
 
 - `voyages.rev` 为当前修订号；`placements` 按 `(voyage_id, rev)` 全量保存每个接受批次后的完整布局（历史可追溯）；
-- `manifests` + `manifest_items` 保存签发时刻的**独立冻结副本**，与后续布局解耦；
+- 安全约束按修订号全量留痕：`voyage_rev_default_limits` / `voyage_rev_column_limits` / `voyage_rev_incompat_rules` 保存每个修订号生效的整套约束。登记写 rev=0 快照；整批调整把当前约束复制到新修订号；约束变更写新清单并把当前布局原样复制到新修订号。`voyages.default_column_limit`、`column_weight_limits`、`incompat_rules` 仅为“当前修订号”镜像，保持既有接口字段兼容；
+- `manifests` + `manifest_items` 保存签发时刻的**独立冻结副本**，与后续布局/约束解耦；
 - 重量以 `BIGINT` 微千克（1kg = 10⁶）存储，精确支持小数重量；
 - `check_jobs` 以 `(voyage_id, manifest_rev)` 唯一引用冻结清单（同一清单最多一个作业，外键随清单删除级联）；
 - `check_reports` 每次受理上报一行：`(job_id, report_no)` 唯一保证上报号幂等、`(job_id, seq)` 唯一记录受理顺序；`revoked=true` 时坐标为空。当前实装状态取每箱 `seq` 最大的一条。

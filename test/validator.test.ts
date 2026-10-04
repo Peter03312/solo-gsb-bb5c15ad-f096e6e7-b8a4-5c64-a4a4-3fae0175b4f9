@@ -2,13 +2,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   BoxInfo,
+  ConstraintSpec,
   Geometry,
   Move,
   Placement,
   Position,
+  checkConstraintSpec,
   checkMoves,
   manhattan,
   microToWeight,
+  normalizeRulePair,
   ruleKey,
   validateLayout,
   weightToMicro,
@@ -141,4 +144,45 @@ test('checkMoves: 未知箱 / 越界坐标 / 同批重复', () => {
 test('撤位 position=null 合法', () => {
   const issues = checkMoves([{ boxNo: 'A', position: null }], g, new Set(['A']));
   assert.deepEqual(issues, []);
+});
+
+test('checkConstraintSpec: 合法整套约束无问题', () => {
+  const spec: ConstraintSpec = {
+    defaultColumnWeightLimit: '10000',
+    columnWeightLimits: [
+      { bay: 1, row: 1, weightLimit: '1200' },
+      { bay: 4, row: 2, weightLimit: '999.5' },
+    ],
+    incompatRules: [
+      { categoryA: '1', categoryB: '3', minDistance: 3 },
+      { categoryA: '5', categoryB: '2', minDistance: 1 }, // 提交时无序
+    ],
+  };
+  assert.deepEqual(checkConstraintSpec(spec, g), []);
+});
+
+test('checkConstraintSpec: 列坐标越界 / 列覆盖重复 / 类别对重复（归一化后）', () => {
+  const spec: ConstraintSpec = {
+    defaultColumnWeightLimit: '10000',
+    columnWeightLimits: [
+      { bay: 5, row: 1, weightLimit: '1200' }, // 越界（bays=4）
+      { bay: 1, row: 1, weightLimit: '1200' },
+      { bay: 1, row: 1, weightLimit: '1300' }, // 同列重复
+    ],
+    incompatRules: [
+      { categoryA: '3', categoryB: '1', minDistance: 2 },
+      { categoryA: '1', categoryB: '3', minDistance: 3 }, // 归一化后与上者重复
+    ],
+  };
+  const issues = checkConstraintSpec(spec, g);
+  const reasons = issues.map((i) => i.reason);
+  assert.ok(reasons.includes('invalid_column_limit'));
+  assert.ok(reasons.includes('duplicate_column_limit'));
+  assert.ok(reasons.includes('duplicate_incompat_rule'));
+});
+
+test('normalizeRulePair: 类别对归一化与顺序无关', () => {
+  assert.deepEqual(normalizeRulePair('3', '1'), { categoryA: '1', categoryB: '3' });
+  assert.deepEqual(normalizeRulePair('1', '3'), { categoryA: '1', categoryB: '3' });
+  assert.equal(ruleKey('3', '1'), '1|3');
 });

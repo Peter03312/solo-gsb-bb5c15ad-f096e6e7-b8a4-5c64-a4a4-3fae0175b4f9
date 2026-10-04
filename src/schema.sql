@@ -108,3 +108,42 @@ CREATE TABLE IF NOT EXISTS check_reports (
     CHECK (NOT revoked OR (bay IS NULL AND row IS NULL AND tier IS NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_check_reports_box ON check_reports (job_id, box_no, seq);
+
+-- ============================================================================
+-- 安全约束按修订号留痕：
+--   每个修订号（含登记时的 rev=0）对应一整套生效约束——默认列承重、
+--   按 (bay,row) 覆盖的单列限额、不相容类别对最小距离。
+-- 约束变更整组替换：未出现在新清单中的覆盖项/类别对视为撤销。
+-- 每次接受“整批调整”或“约束变更”后，新修订号继承一套完整快照。
+-- 上方的 voyages.default_column_limit / column_weight_limits / incompat_rules
+-- 仅作为“当前修订号”的镜像保留，供既有接口字段兼容使用。
+-- ============================================================================
+
+-- 每个修订号生效的默认列承重上限（每航次每修订号一行）
+CREATE TABLE IF NOT EXISTS voyage_rev_default_limits (
+    voyage_id    UUID NOT NULL REFERENCES voyages(id) ON DELETE CASCADE,
+    rev          INTEGER NOT NULL CHECK (rev >= 0),
+    weight_limit BIGINT NOT NULL CHECK (weight_limit > 0), -- 微克
+    PRIMARY KEY (voyage_id, rev)
+);
+
+-- 每个修订号生效的按列承重覆盖清单（整组替换语义的留痕副本）
+CREATE TABLE IF NOT EXISTS voyage_rev_column_limits (
+    voyage_id    UUID NOT NULL REFERENCES voyages(id) ON DELETE CASCADE,
+    rev          INTEGER NOT NULL CHECK (rev >= 0),
+    bay          INTEGER NOT NULL CHECK (bay >= 1),
+    row          INTEGER NOT NULL CHECK (row >= 1),
+    weight_limit BIGINT NOT NULL CHECK (weight_limit > 0), -- 微克
+    PRIMARY KEY (voyage_id, rev, bay, row)
+);
+
+-- 每个修订号生效的不相容类别对清单（整组替换语义的留痕副本，cat_a <= cat_b）
+CREATE TABLE IF NOT EXISTS voyage_rev_incompat_rules (
+    voyage_id    UUID NOT NULL REFERENCES voyages(id) ON DELETE CASCADE,
+    rev          INTEGER NOT NULL CHECK (rev >= 0),
+    cat_a        TEXT NOT NULL,
+    cat_b        TEXT NOT NULL,
+    min_distance INTEGER NOT NULL CHECK (min_distance > 0),
+    PRIMARY KEY (voyage_id, rev, cat_a, cat_b),
+    CHECK (cat_a <= cat_b)
+);

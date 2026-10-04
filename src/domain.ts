@@ -99,6 +99,117 @@ export type RequestIssue =
       occurrences: number;
     };
 
+/** 安全约束整组输入（登记 / 约束变更共用） */
+export interface ConstraintSpec {
+  /** 默认列承重上限（千克，十进制字符串，必须为正数） */
+  defaultColumnWeightLimit: string;
+  /** 按 (bay,row) 覆盖的单列上限；整组清单语义（未列出即撤销） */
+  columnWeightLimits: { bay: number; row: number; weightLimit: string }[];
+  /** 不相容类别对最小距离（正整数）；整组清单语义（未列出即视为相容） */
+  incompatRules: { categoryA: string; categoryB: string; minDistance: number }[];
+}
+
+export type ConstraintIssue =
+  | {
+      reason: 'invalid_column_limit';
+      message: string;
+      bay: number;
+      row: number;
+    }
+  | {
+      reason: 'duplicate_column_limit';
+      message: string;
+      bay: number;
+      row: number;
+      occurrences: number;
+    }
+  | {
+      reason: 'duplicate_incompat_rule';
+      message: string;
+      categoryA: string;
+      categoryB: string;
+      occurrences: number;
+    };
+
+/** 类别对归一化（与存储顺序无关），返回的 categoryA <= categoryB */
+export function normalizeRulePair(
+  catA: string,
+  catB: string,
+): { categoryA: string; categoryB: string } {
+  return catA <= catB ? { categoryA: catA, categoryB: catB } : { categoryA: catB, categoryB: catA };
+}
+
+/**
+ * 校验一整套安全约束（登记与约束变更沿用同一套校验）：
+ * 列覆盖坐标必须在舱位范围内、同列覆盖至多一条、类别对唯一。
+ * 重量正数与距离正整数由 HTTP 层 zod 先行保证，此处仅做整数坐标与去重防御。
+ */
+export function checkConstraintSpec(spec: ConstraintSpec, geometry: Geometry): ConstraintIssue[] {
+  const issues: ConstraintIssue[] = [];
+
+  const colSeen = new Map<string, { bay: number; row: number; occurrences: number }>();
+  for (const l of spec.columnWeightLimits) {
+    const key = columnKey(l.bay, l.row);
+    const entry = colSeen.get(key) ?? { bay: l.bay, row: l.row, occurrences: 0 };
+    entry.occurrences += 1;
+    colSeen.set(key, entry);
+
+    if (
+      !Number.isInteger(l.bay) ||
+      !Number.isInteger(l.row) ||
+      l.bay < 1 ||
+      l.bay > geometry.bays ||
+      l.row < 1 ||
+      l.row > geometry.rows
+    ) {
+      issues.push({
+        reason: 'invalid_column_limit',
+        message: `列承重配置坐标 (bay=${l.bay}, row=${l.row}) 超出舱位范围 (bay 1..${geometry.bays}, row 1..${geometry.rows})`,
+        bay: l.bay,
+        row: l.row,
+      });
+    }
+  }
+  for (const e of colSeen.values()) {
+    if (e.occurrences > 1) {
+      issues.push({
+        reason: 'duplicate_column_limit',
+        message: `列承重覆盖 (bay=${e.bay}, row=${e.row}) 在提交清单中出现 ${e.occurrences} 次，每列至多一条覆盖`,
+        bay: e.bay,
+        row: e.row,
+        occurrences: e.occurrences,
+      });
+    }
+  }
+
+  const ruleSeen = new Map<string, { a: string; b: string; occurrences: number }>();
+  for (const r of spec.incompatRules) {
+    const pair = normalizeRulePair(r.categoryA, r.categoryB);
+    const key = ruleKey(pair.categoryA, pair.categoryB);
+    const entry = ruleSeen.get(key) ?? { a: pair.categoryA, b: pair.categoryB, occurrences: 0 };
+    entry.occurrences += 1;
+    ruleSeen.set(key, entry);
+  }
+  for (const e of ruleSeen.values()) {
+    if (e.occurrences > 1) {
+      issues.push({
+        reason: 'duplicate_incompat_rule',
+        message: `不相容类别对 (${e.a}, ${e.b}) 在提交清单中出现 ${e.occurrences} 次，每对至多设定一个最小距离`,
+        categoryA: e.a,
+        categoryB: e.b,
+        occurrences: e.occurrences,
+      });
+    }
+  }
+
+  return issues.sort(
+    (a, b) =>
+      a.reason.localeCompare(b.reason) ||
+      String('bay' in a ? a.bay : '').localeCompare(String('bay' in b ? b.bay : '')) ||
+      String('row' in a ? a.row : '').localeCompare(String('row' in b ? b.row : '')),
+  );
+}
+
 /** 重量统一换算为毫克级整数（1 kg = 1_000_000），精确比较 */
 export function weightToMicro(weight: string): bigint {
   if (!/^\d+(\.\d+)?$/.test(weight)) {

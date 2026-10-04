@@ -40,6 +40,40 @@ GET {{host}}/api/voyages/{{id}}/layout
 ### 历史布局（某修订号）
 GET {{host}}/api/voyages/{{id}}/layout?rev=1
 
+### 安全约束变更（整组替换；未列出的列覆盖/类别对即撤销；携带所见修订号）
+### 受理前按新约束复验当前完整布局，违反则 422 返回箱号/位置/原因，规则与修订号不变
+PUT {{host}}/api/voyages/{{id}}/constraints
+Content-Type: application/json
+
+{
+  "baseRevision": 0,
+  "defaultColumnWeightLimit": "9000",
+  "columnWeightLimits": [
+    { "bay": 1, "row": 1, "weightLimit": "1100" }
+  ],
+  "incompatRules": [
+    { "categoryA": "1", "categoryB": "3", "minDistance": 4 }
+  ]
+}
+
+### 撤销全部按列覆盖与类别对（传空数组），仅改默认承重；类别对为空即全部相容
+PUT {{host}}/api/voyages/{{id}}/constraints
+Content-Type: application/json
+
+{
+  "baseRevision": 1,
+  "defaultColumnWeightLimit": "8000",
+  "columnWeightLimits": [],
+  "incompatRules": []
+}
+
+### 查询当前生效约束
+GET {{host}}/api/voyages/{{id}}/constraints
+
+### 查询历史修订号当时生效的约束
+GET {{host}}/api/voyages/{{id}}/constraints?rev=1
+
+
 ### 整批调整（携带所见修订号；position=null 表示暂留空；允许同批交换）
 POST {{host}}/api/voyages/{{id}}/moves
 Content-Type: application/json

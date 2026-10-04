@@ -9,6 +9,7 @@ import {
   createVoyageSchema,
   issueManifestSchema,
   openCheckJobSchema,
+  updateConstraintsSchema,
 } from './schemas';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -69,6 +70,30 @@ export function createApiRouter(service: VoyageService, checkService: CheckServi
       rev = Number(revRaw);
     }
     service.getLayout(id, rev).then((v) => res.json(v)).catch(next);
+  });
+
+  // 安全约束变更（整组替换，携带所见修订号；受理前按新约束复验当前完整布局）
+  router.put('/voyages/:id/constraints', (req, res, next) => {
+    const id = parseVoyageId(req);
+    const input = parseBody(updateConstraintsSchema, req.body);
+    service
+      .updateConstraints(id, input)
+      .then((v) => res.status(200).json(v))
+      .catch(next);
+  });
+
+  // 查询某修订号生效的安全约束（缺省当前；历史修订号返回当时清单）
+  router.get('/voyages/:id/constraints', (req, res, next) => {
+    const id = parseVoyageId(req);
+    const revRaw = req.query.rev;
+    let rev: number | undefined;
+    if (revRaw !== undefined) {
+      if (typeof revRaw !== 'string' || !/^\d+$/.test(revRaw)) {
+        throw HttpError.badRequest('invalid_revision', 'rev 必须为非负整数');
+      }
+      rev = Number(revRaw);
+    }
+    service.getConstraints(id, rev).then((v) => res.json(v)).catch(next);
   });
 
   // 整批调整（携带所见修订号，允许同批交换）

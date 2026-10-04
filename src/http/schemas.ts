@@ -73,6 +73,19 @@ export const issueManifestSchema = z.object({
   expectedRevision: nonNegativeInt,
 });
 
+/**
+ * 安全约束变更：整组替换语义。
+ * 必须同时携带调度员所见的 baseRevision 以及【完整的】三套清单：
+ * 默认列承重、按列覆盖限额（未列出即撤销）、不相容类别对（未列出即相容）。
+ * 重量正数、坐标正整数、类别对最小距离正整数等校验与登记完全一致。
+ */
+export const updateConstraintsSchema = z.object({
+  baseRevision: nonNegativeInt,
+  defaultColumnWeightLimit: weightString,
+  columnWeightLimits: z.array(columnLimitSchema),
+  incompatRules: z.array(ruleSchema),
+});
+
 // ---- 现场装船核对 ----
 
 export const openCheckJobSchema = z.object({

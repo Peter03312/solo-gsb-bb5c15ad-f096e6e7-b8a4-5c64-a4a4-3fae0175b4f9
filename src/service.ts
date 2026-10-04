@@ -52,6 +52,24 @@ export interface ApplyMovesInput {
   moves: Move[];
 }
 
+/** 安全约束整批变更：整套默认列承重 + 按列覆盖限额 + 不相容类别对（全量替换语义） */
+export interface UpdateConstraintsInput {
+  baseRevision: number;
+  defaultColumnWeightLimit: string;
+  columnWeightLimits: ColumnLimitInput[];
+  incompatRules: RuleInput[];
+}
+
+/** 某修订号生效的约束快照 */
+export interface ConstraintSnapshot {
+  /** 默认列承重（微克） */
+  defaultLimit: bigint;
+  /** 按列覆盖（微克），key = columnKey(bay,row)；未列出的列回退到 defaultLimit */
+  columnLimits: Map<string, bigint>;
+  /** 不相容类别对：归一化类别键 -> 最小曼哈顿距离（正整数） */
+  rules: Map<string, number>;
+}
+
 interface VoyageRow {
   id: string;
   voyage_no: string;
@@ -87,14 +105,88 @@ function voyageToJson(v: VoyageRow): VoyageJson {
   };
 }
 
+/* ---------- 请求级校验：约束集合（登记 / 约束变更共用，规则一致） ---------- */
+
+/**
+ * 校验一套安全约束输入本身是否合法（不涉及布局）：
+ *  - 列覆盖坐标必须在舱位范围内；
+ *  - 同一 (bay,row) 不得重复给出覆盖限额；
+ *  - 不相容类别对归一化后不得重复（每对至多一个最小距离）。
+ * 正数（重量/距离）由 zod 请求体层保证。
+ */
+function validateConstraintInputs(
+  geometry: Geometry,
+  defaultColumnWeightLimit: string,
+  columnWeightLimits: ColumnLimitInput[],
+  incompatRules: RuleInput[],
+): void {
+  // 默认列承重为正数（zod 已校验，此处防御性换算，非法格式直接 400）
+  try {
+    weightToMicro(defaultColumnWeightLimit);
+  } catch {
+    throw HttpError.badRequest(
+      'invalid_default_column_limit',
+      `默认列承重非法（必须为正数 kg）: ${defaultColumnWeightLimit}`,
+    );
+  }
+
+  const seenCols = new Set<string>();
+  for (const l of columnWeightLimits) {
+    if (
+      !Number.isInteger(l.bay) ||
+      !Number.isInteger(l.row) ||
+      l.bay < 1 ||
+      l.bay > geometry.bays ||
+      l.row < 1 ||
+      l.row > geometry.rows
+    ) {
+      throw HttpError.badRequest(
+        'invalid_column_limit',
+        `列承重配置坐标 (bay=${l.bay}, row=${l.row}) 超出舱位范围`,
+        l,
+      );
+    }
+    const key = columnKey(l.bay, l.row);
+    if (seenCols.has(key)) {
+      throw HttpError.badRequest(
+        'duplicate_column_limit',
+        `列 (bay=${l.bay}, row=${l.row}) 的承重覆盖限额重复给出，每列至多一个覆盖值`,
+        { bay: l.bay, row: l.row },
+      );
+    }
+    seenCols.add(key);
+    try {
+      weightToMicro(l.weightLimit);
+    } catch {
+      throw HttpError.badRequest(
+        'invalid_column_limit',
+        `列 (bay=${l.bay}, row=${l.row}) 承重非法（必须为正数 kg）: ${l.weightLimit}`,
+        l,
+      );
+    }
+  }
+
+  const seenRules = new Set<string>();
+  for (const r of incompatRules) {
+    const key = ruleKey(r.categoryA, r.categoryB);
+    if (seenRules.has(key)) {
+      throw HttpError.badRequest(
+        'duplicate_incompat_rule',
+        '存在重复的不相容类别对，每对至多设定一个最小距离',
+        { categoryA: r.categoryA, categoryB: r.categoryB },
+      );
+    }
+    seenRules.add(key);
+  }
+}
+
 /* ---------- 读取辅助 ---------- */
 
 interface LoadedVoyageData {
   geometry: Geometry;
   boxes: BoxInfo[];
-  columnLimits: Map<string, bigint>;
-  defaultColumnLimit: bigint;
-  rules: Map<string, number>;
+  /** 当前加载修订号生效的约束 */
+  constraints: ConstraintSnapshot;
   placements: Placement[];
 }
 
@@ -113,35 +205,48 @@ async function loadVoyageRow(
   return { ...row, default_column_limit: BigInt(row.default_column_limit as string) };
 }
 
-async function loadVoyageData(
-  client: PoolClient,
-  v: VoyageRow,
-  rev: number,
-): Promise<LoadedVoyageData> {
-  const [boxRes, limitRes, ruleRes, placeRes] = await Promise.all([
-    client.query(
-      `SELECT box_no, weight_ug::text AS weight_ug, category FROM boxes WHERE voyage_id=$1 ORDER BY box_no`,
-      [v.id],
-    ),
-    client.query(
-      `SELECT bay, row, weight_limit::text AS weight_limit FROM column_weight_limits WHERE voyage_id=$1 ORDER BY bay,row`,
-      [v.id],
-    ),
-    client.query(
-      `SELECT cat_a, cat_b, min_distance FROM incompat_rules WHERE voyage_id=$1 ORDER BY cat_a,cat_b`,
-      [v.id],
-    ),
-    client.query(
-      `SELECT box_no, bay, row, tier FROM placements WHERE voyage_id=$1 AND rev=$2 ORDER BY box_no`,
-      [v.id, rev],
-    ),
-  ]);
-
-  const boxes: BoxInfo[] = boxRes.rows.map((r) => ({
+/** 读取航次箱档案（不可变更） */
+async function loadBoxes(client: PoolClient, voyageId: string): Promise<BoxInfo[]> {
+  const boxRes = await client.query(
+    `SELECT box_no, weight_ug::text AS weight_ug, category FROM boxes WHERE voyage_id=$1 ORDER BY box_no`,
+    [voyageId],
+  );
+  return boxRes.rows.map((r) => ({
     boxNo: r.box_no as string,
     weight: microToWeight(BigInt(r.weight_ug as string)),
     category: r.category as string,
   }));
+}
+
+/** 读取某修订号生效的约束快照（默认列承重 + 按列覆盖 + 不相容规则） */
+async function loadConstraints(
+  client: PoolClient,
+  voyageId: string,
+  rev: number,
+): Promise<ConstraintSnapshot> {
+  const [defRes, limitRes, ruleRes] = await Promise.all([
+    client.query(
+      `SELECT weight_limit::text AS weight_limit FROM constraint_defaults WHERE voyage_id=$1 AND rev=$2`,
+      [voyageId, rev],
+    ),
+    client.query(
+      `SELECT bay, row, weight_limit::text AS weight_limit
+       FROM constraint_column_limits WHERE voyage_id=$1 AND rev=$2 ORDER BY bay,row`,
+      [voyageId, rev],
+    ),
+    client.query(
+      `SELECT cat_a, cat_b, min_distance
+       FROM constraint_incompat_rules WHERE voyage_id=$1 AND rev=$2 ORDER BY cat_a,cat_b`,
+      [voyageId, rev],
+    ),
+  ]);
+
+  const defRow = defRes.rows[0];
+  if (!defRow) {
+    throw new Error(`航次 ${voyageId} 缺少修订号 ${rev} 的约束快照（数据不一致）`);
+  }
+  const defaultLimit = BigInt(defRow.weight_limit as string);
+
   const columnLimits = new Map<string, bigint>();
   for (const r of limitRes.rows) {
     columnLimits.set(columnKey(r.bay as number, r.row as number), BigInt(r.weight_limit as string));
@@ -150,6 +255,23 @@ async function loadVoyageData(
   for (const r of ruleRes.rows) {
     rules.set(ruleKey(r.cat_a as string, r.cat_b as string), Number(r.min_distance));
   }
+  return { defaultLimit, columnLimits, rules };
+}
+
+async function loadVoyageData(
+  client: PoolClient,
+  v: VoyageRow,
+  rev: number,
+): Promise<LoadedVoyageData> {
+  const [boxes, constraints, placeRes] = await Promise.all([
+    loadBoxes(client, v.id),
+    loadConstraints(client, v.id, rev),
+    client.query(
+      `SELECT box_no, bay, row, tier FROM placements WHERE voyage_id=$1 AND rev=$2 ORDER BY box_no`,
+      [v.id, rev],
+    ),
+  ]);
+
   const placements: Placement[] = placeRes.rows.map((r) => ({
     boxNo: r.box_no as string,
     position: { bay: r.bay, row: r.row, tier: r.tier } as Position,
@@ -158,9 +280,7 @@ async function loadVoyageData(
   return {
     geometry: { bays: v.n_bays, rows: v.n_rows, tiers: v.n_tiers },
     boxes,
-    columnLimits,
-    defaultColumnLimit: v.default_column_limit,
-    rules,
+    constraints,
     placements,
   };
 }
@@ -172,24 +292,12 @@ export class VoyageService {
 
   async createVoyage(input: CreateVoyageInput): Promise<VoyageJson> {
     const geometry: Geometry = { bays: input.bays, rows: input.rows, tiers: input.tiers };
-
-    // 登记时校验列承重坐标
-    const badLimit = input.columnWeightLimits.find(
-      (l) =>
-        !Number.isInteger(l.bay) ||
-        !Number.isInteger(l.row) ||
-        l.bay < 1 ||
-        l.bay > geometry.bays ||
-        l.row < 1 ||
-        l.row > geometry.rows,
+    validateConstraintInputs(
+      geometry,
+      input.defaultColumnWeightLimit,
+      input.columnWeightLimits,
+      input.incompatRules,
     );
-    if (badLimit) {
-      throw HttpError.badRequest(
-        'invalid_column_limit',
-        `列承重配置坐标 (bay=${badLimit.bay}, row=${badLimit.row}) 超出舱位范围`,
-        badLimit,
-      );
-    }
 
     const client = await this.pool.connect();
     try {
@@ -225,20 +333,6 @@ export class VoyageService {
         throw err;
       }
 
-      if (input.columnWeightLimits.length > 0) {
-        const values: string[] = [];
-        const params: (string | number)[] = [v.id];
-        let i = 2;
-        for (const l of input.columnWeightLimits) {
-          values.push(`($1, $${i++}, $${i++}, $${i++})`);
-          params.push(l.bay, l.row, weightToMicro(l.weightLimit).toString());
-        }
-        await client.query(
-          `INSERT INTO column_weight_limits (voyage_id, bay, row, weight_limit) VALUES ${values.join(',')}`,
-          params,
-        );
-      }
-
       if (input.boxes.length > 0) {
         const values: string[] = [];
         const params: (string | number)[] = [v.id];
@@ -253,31 +347,8 @@ export class VoyageService {
         );
       }
 
-      if (input.incompatRules.length > 0) {
-        const values: string[] = [];
-        const params: (string | number)[] = [v.id];
-        let i = 2;
-        for (const r of input.incompatRules) {
-          values.push(`($1, $${i++}, $${i++}, $${i++})`);
-          const [a, b] =
-            r.categoryA <= r.categoryB ? [r.categoryA, r.categoryB] : [r.categoryB, r.categoryA];
-          params.push(a, b, r.minDistance);
-        }
-        try {
-          await client.query(
-            `INSERT INTO incompat_rules (voyage_id, cat_a, cat_b, min_distance) VALUES ${values.join(',')}`,
-            params,
-          );
-        } catch (err) {
-          if ((err as { code?: string }).code === '23505') {
-            throw HttpError.badRequest(
-              'duplicate_incompat_rule',
-              '存在重复的不相容类别对，每对至多设定一个最小距离',
-            );
-          }
-          throw err;
-        }
-      }
+      // 登记即产生 rev=0 的约束快照
+      await this.writeConstraintSnapshot(client, v.id, 0, input);
 
       await client.query('COMMIT');
       return voyageToJson(v);
@@ -286,6 +357,58 @@ export class VoyageService {
       throw err;
     } finally {
       client.release();
+    }
+  }
+
+  /**
+   * 把整套约束写入某修订号的快照表（全量替换到该 rev；调用方保证该 rev 尚无快照）。
+   * 舱位尺寸与箱档案不在此写入。
+   */
+  private async writeConstraintSnapshot(
+    client: PoolClient,
+    voyageId: string,
+    rev: number,
+    input: {
+      defaultColumnWeightLimit: string;
+      columnWeightLimits: ColumnLimitInput[];
+      incompatRules: RuleInput[];
+    },
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO constraint_defaults (voyage_id, rev, weight_limit) VALUES ($1,$2,$3)`,
+      [voyageId, rev, weightToMicro(input.defaultColumnWeightLimit).toString()],
+    );
+
+    if (input.columnWeightLimits.length > 0) {
+      const values: string[] = [];
+      const params: (string | number)[] = [voyageId, rev];
+      let i = 3;
+      for (const l of input.columnWeightLimits) {
+        values.push(`($1, $2, $${i++}, $${i++}, $${i++})`);
+        params.push(l.bay, l.row, weightToMicro(l.weightLimit).toString());
+      }
+      await client.query(
+        `INSERT INTO constraint_column_limits (voyage_id, rev, bay, row, weight_limit)
+         VALUES ${values.join(',')}`,
+        params,
+      );
+    }
+
+    if (input.incompatRules.length > 0) {
+      const values: string[] = [];
+      const params: (string | number)[] = [voyageId, rev];
+      let i = 3;
+      for (const r of input.incompatRules) {
+        values.push(`($1, $2, $${i++}, $${i++}, $${i++})`);
+        const [a, b] =
+          r.categoryA <= r.categoryB ? [r.categoryA, r.categoryB] : [r.categoryB, r.categoryA];
+        params.push(a, b, r.minDistance);
+      }
+      await client.query(
+        `INSERT INTO constraint_incompat_rules (voyage_id, rev, cat_a, cat_b, min_distance)
+         VALUES ${values.join(',')}`,
+        params,
+      );
     }
   }
 
@@ -320,7 +443,7 @@ export class VoyageService {
     } as VoyageRow);
   }
 
-  /** 查询某修订号布局（rev 缺省为当前修订号） */
+  /** 查询某修订号布局（rev 缺省为当前修订号）；同时返回该修订号当时生效的约束 */
   async getLayout(id: string, rev?: number) {
     const client = await this.pool.connect();
     try {
@@ -353,13 +476,13 @@ export class VoyageService {
       revision: rev,
       current: rev === v.rev,
       geometry: data.geometry,
-      defaultColumnWeightLimit: microToWeight(data.defaultColumnLimit),
-      columnWeightLimits: [...data.columnLimits.entries()].map(([key, limit]) => {
+      defaultColumnWeightLimit: microToWeight(data.constraints.defaultLimit),
+      columnWeightLimits: [...data.constraints.columnLimits.entries()].map(([key, limit]) => {
         const [bay, row] = key.split('/').map(Number);
         return { bay, row, weightLimit: microToWeight(limit) };
       }),
       boxes: data.boxes,
-      incompatRules: [...data.rules.entries()].map(([key, minDistance]) => {
+      incompatRules: [...data.constraints.rules.entries()].map(([key, minDistance]) => {
         const [categoryA, categoryB] = key.split('|');
         return { categoryA, categoryB, minDistance };
       }),
@@ -375,6 +498,7 @@ export class VoyageService {
   /**
    * 携带所见修订号整批调整。同批可交换（先撤后放仅用于计算最终布局，
    * 校验只针对最终布局）。任一规则违反则整批拒绝。
+   * 约束沿用当前修订号：把当前约束快照复制到新修订号，布局按本批生成。
    */
   async applyMoves(id: string, input: ApplyMovesInput) {
     const client = await this.pool.connect();
@@ -416,14 +540,14 @@ export class VoyageService {
         .filter((entry): entry is [string, Position] => entry[1] !== null)
         .map(([boxNo, position]) => ({ boxNo, position }));
 
-      // 规则校验：任何违反整批拒绝
+      // 规则校验（使用当前修订号约束）：任何违反整批拒绝
       const violations: Violation[] = validateLayout({
         geometry: data.geometry,
         boxes: data.boxes,
         placements: finalPlacements,
-        columnLimits: data.columnLimits,
-        defaultColumnLimit: data.defaultColumnLimit,
-        rules: data.rules,
+        columnLimits: data.constraints.columnLimits,
+        defaultColumnLimit: data.constraints.defaultLimit,
+        rules: data.constraints.rules,
       });
       if (violations.length > 0) {
         throw HttpError.validationFailed(violations);
@@ -443,6 +567,8 @@ export class VoyageService {
           params,
         );
       }
+      // 约束随修订号快照：布局调整继承当前约束
+      await this.copyConstraintSnapshot(client, v.id, v.rev, nextRev);
       await client.query(`UPDATE voyages SET rev=$2 WHERE id=$1`, [v.id, nextRev]);
 
       await client.query('COMMIT');
@@ -462,10 +588,148 @@ export class VoyageService {
     }
   }
 
+  /** 把某修订号的整套约束快照复制到另一修订号（布局调整时沿用约束） */
+  private async copyConstraintSnapshot(
+    client: PoolClient,
+    voyageId: string,
+    fromRev: number,
+    toRev: number,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO constraint_defaults (voyage_id, rev, weight_limit)
+       SELECT voyage_id, $3, weight_limit FROM constraint_defaults
+       WHERE voyage_id=$1 AND rev=$2`,
+      [voyageId, fromRev, toRev],
+    );
+    await client.query(
+      `INSERT INTO constraint_column_limits (voyage_id, rev, bay, row, weight_limit)
+       SELECT voyage_id, $3, bay, row, weight_limit FROM constraint_column_limits
+       WHERE voyage_id=$1 AND rev=$2`,
+      [voyageId, fromRev, toRev],
+    );
+    await client.query(
+      `INSERT INTO constraint_incompat_rules (voyage_id, rev, cat_a, cat_b, min_distance)
+       SELECT voyage_id, $3, cat_a, cat_b, min_distance FROM constraint_incompat_rules
+       WHERE voyage_id=$1 AND rev=$2`,
+      [voyageId, fromRev, toRev],
+    );
+  }
+
+  /**
+   * 安全约束整批变更（乐观修订号，全量替换语义）：
+   *  - 携带所见 baseRevision；过期 -> 409 stale_revision（返回当前修订号）；
+   *  - 提交整套默认列承重、按列覆盖限额、不相容类别对；未列出的覆盖项/类别对即撤销；
+   *  - 舱位尺寸与箱档案不变；
+   *  - 受理前按新约束复验【当前完整布局】，违反配载规则 -> 422，规则与修订号均不变；
+   *  - 受理后修订号 +1，当前布局原样继承（复制到新修订号），新约束自新修订号生效；
+   *  - 旧清单与在办核对仍以各自冻结清单为基准，不受影响；后续调整/签发使用新约束。
+   */
+  async updateConstraints(id: string, input: UpdateConstraintsInput) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const v = await loadVoyageRow(client, id, true);
+      if (!v) {
+        throw HttpError.notFound('voyage_not_found', `航次 ${id} 不存在`);
+      }
+      if (!Number.isInteger(input.baseRevision) || input.baseRevision < 0) {
+        throw HttpError.badRequest('invalid_revision', 'baseRevision 必须为非负整数');
+      }
+      if (v.rev !== input.baseRevision) {
+        throw HttpError.staleRevision(v.rev, input.baseRevision);
+      }
+
+      const geometry: Geometry = { bays: v.n_bays, rows: v.n_rows, tiers: v.n_tiers };
+
+      // 沿用登记时的正数 / 列坐标 / 类别对唯一性校验
+      validateConstraintInputs(
+        geometry,
+        input.defaultColumnWeightLimit,
+        input.columnWeightLimits,
+        input.incompatRules,
+      );
+
+      const data = await loadVoyageData(client, v, v.rev);
+
+      // 按新约束构造快照（尚未落库），复验当前完整布局
+      const newConstraints = this.buildConstraintSnapshot(input);
+      const violations: Violation[] = validateLayout({
+        geometry,
+        boxes: data.boxes,
+        placements: data.placements,
+        columnLimits: newConstraints.columnLimits,
+        defaultColumnLimit: newConstraints.defaultLimit,
+        rules: newConstraints.rules,
+      });
+      if (violations.length > 0) {
+        throw HttpError.validationFailed(violations);
+      }
+
+      const nextRev = v.rev + 1;
+
+      // 布局原样继承：把当前布局整列复制到新修订号
+      await client.query(
+        `INSERT INTO placements (voyage_id, rev, box_no, bay, row, tier)
+         SELECT voyage_id, $3, box_no, bay, row, tier FROM placements
+         WHERE voyage_id=$1 AND rev=$2`,
+        [v.id, v.rev, nextRev],
+      );
+
+      // 新约束快照在新修订号生效
+      await this.writeConstraintSnapshot(client, v.id, nextRev, input);
+
+      // 当前默认列承重冗余同步，修订号 +1
+      await client.query(
+        `UPDATE voyages SET rev=$2, default_column_limit=$3 WHERE id=$1`,
+        [v.id, nextRev, weightToMicro(input.defaultColumnWeightLimit).toString()],
+      );
+
+      await client.query('COMMIT');
+
+      const newData: LoadedVoyageData = {
+        geometry,
+        boxes: data.boxes,
+        constraints: newConstraints,
+        placements: data.placements,
+      };
+      return {
+        revision: nextRev,
+        previousRevision: v.rev,
+        constraintsChanged: true,
+        layoutInherited: true,
+        layout: this.serializeLayout({ ...v, rev: nextRev }, nextRev, newData),
+      };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** 由输入构造内存中的约束快照（用于受理前复验） */
+  private buildConstraintSnapshot(input: UpdateConstraintsInput): ConstraintSnapshot {
+    const columnLimits = new Map<string, bigint>();
+    for (const l of input.columnWeightLimits) {
+      columnLimits.set(columnKey(l.bay, l.row), weightToMicro(l.weightLimit));
+    }
+    const rules = new Map<string, number>();
+    for (const r of input.incompatRules) {
+      rules.set(ruleKey(r.categoryA, r.categoryB), r.minDistance);
+    }
+    return {
+      defaultLimit: weightToMicro(input.defaultColumnWeightLimit),
+      columnLimits,
+      rules,
+    };
+  }
+
   /**
    * 签发装载清单：所有箱必须已配位；内容冻结到 expectedRevision 的布局。
    * expectedRevision 必须等于当前修订号，防止为过期布局签发“当前清单”。
    * 对同一修订号重复签发幂等返回既有清单。
+   * 复验使用当前修订号生效的约束。
    */
   async issueManifest(id: string, expectedRevision: number) {
     const client = await this.pool.connect();
@@ -511,14 +775,14 @@ export class VoyageService {
         );
       }
 
-      // 防御性复验（布局仅由 applyMoves 产生，正常不会触发）
+      // 防御性复验（布局/约束仅由受控接口产生，正常不会触发）
       const violations = validateLayout({
         geometry: data.geometry,
         boxes: data.boxes,
         placements: data.placements,
-        columnLimits: data.columnLimits,
-        defaultColumnLimit: data.defaultColumnLimit,
-        rules: data.rules,
+        columnLimits: data.constraints.columnLimits,
+        defaultColumnLimit: data.constraints.defaultLimit,
+        rules: data.constraints.rules,
       });
       if (violations.length > 0) {
         throw HttpError.validationFailed(violations);

@@ -77,6 +77,25 @@ Content-Type: application/json
   ]
 }
 
+### 安全约束变更（携带所见修订号；整套替换；受理前按新约束复验当前布局）
+### 未列出的按列覆盖/不相容类别对即撤销；舱位尺寸与箱档案不变
+POST {{host}}/api/voyages/{{id}}/constraints
+Content-Type: application/json
+
+{
+  "baseRevision": 2,
+  "defaultColumnWeightLimit": "9000",
+  "columnWeightLimits": [
+    { "bay": 2, "row": 2, "weightLimit": "9999" }
+  ],
+  "incompatRules": [
+    { "categoryA": "1", "categoryB": "5", "minDistance": 2 }
+  ]
+}
+
+### 历史布局同时返回该修订号当时生效的约束（默认承重/覆盖/类别对）
+GET {{host}}/api/voyages/{{id}}/layout?rev=1
+
 ### 签发装载清单（所有箱须已配位；冻结当前修订号）
 POST {{host}}/api/voyages/{{id}}/manifests
 Content-Type: application/json

@@ -9,6 +9,7 @@ import {
   createVoyageSchema,
   issueManifestSchema,
   openCheckJobSchema,
+  updateConstraintsSchema,
 } from './schemas';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -77,6 +78,16 @@ export function createApiRouter(service: VoyageService, checkService: CheckServi
     const input = parseBody(applyMovesSchema, req.body);
     service
       .applyMoves(id, input)
+      .then((v) => res.status(200).json(v))
+      .catch(next);
+  });
+
+  // 安全约束变更（携带所见修订号，整套替换；受理前按新约束复验当前布局）
+  router.post('/voyages/:id/constraints', (req, res, next) => {
+    const id = parseVoyageId(req);
+    const input = parseBody(updateConstraintsSchema, req.body);
+    service
+      .updateConstraints(id, input)
       .then((v) => res.status(200).json(v))
       .catch(next);
   });

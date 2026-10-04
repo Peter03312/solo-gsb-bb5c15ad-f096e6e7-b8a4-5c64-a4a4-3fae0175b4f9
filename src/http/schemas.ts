@@ -69,6 +69,25 @@ export const applyMovesSchema = applyMovesInput.transform((d) => ({
   moves: d.moves ?? [],
 }));
 
+/**
+ * 安全约束整批变更：携带所见 baseRevision，提交整套
+ * 默认列承重 / 按列覆盖限额 / 不相容类别对（全量替换：未列出即撤销）。
+ * 正数、列坐标、类别对唯一性的业务规则在 service 层沿用登记校验。
+ */
+export const updateConstraintsSchema = z
+  .object({
+    baseRevision: nonNegativeInt,
+    defaultColumnWeightLimit: weightString,
+    columnWeightLimits: z.array(columnLimitSchema).optional(),
+    incompatRules: z.array(ruleSchema).optional(),
+  })
+  .transform((d) => ({
+    baseRevision: d.baseRevision,
+    defaultColumnWeightLimit: d.defaultColumnWeightLimit,
+    columnWeightLimits: d.columnWeightLimits ?? [],
+    incompatRules: d.incompatRules ?? [],
+  }));
+
 export const issueManifestSchema = z.object({
   expectedRevision: nonNegativeInt,
 });
